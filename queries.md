@@ -501,3 +501,116 @@ Would you like to proceed with this format for all remaining slides?
 
 
 
+
+
+
+### **Slide 4: Total InActive Node Count**  
+**Panel Name:** Total InActive Node Count  
+
+---
+
+### **1. Full PromQL Query**
+```promql
+count(avg_over_time(up{job="kubernetes-nodes",cluster_type=~"$clustertype",cluster_name=~"$clustername"}[$__range]) < 0.999) * 1
+```
+
+---
+
+### **2. Whole Query Explanation**  
+**Purpose:**  
+Counts **only unhealthy Kubernetes nodes** that had <99.9% uptime during the specified time window.
+
+**Key Differences from Slide 3 (Active Nodes):**  
+- Focuses **only** on nodes failing the 99.9% uptime threshold  
+- Uses identical time averaging for consistency  
+- Complements Slide 3's healthy count  
+
+**High-Level Workflow:**  
+1. Calculate each node's average uptime (same as Slide 3)  
+2. Apply <99.9% filter to identify unhealthy nodes  
+3. Count all nodes below threshold  
+
+---
+
+### **3. Component Breakdown**  
+
+#### **A. Data Collection Layer**
+```promql
+avg_over_time(up{job="kubernetes-nodes", [...]}[$__range])
+```
+- Identical to Slide 3  
+- Outputs a decimal value (0-1) per node representing uptime percentage  
+
+#### **B. Health Classification Layer**
+```promql
+< 0.999
+```
+- **Threshold Logic:**  
+  - Catches nodes with **any significant downtime**  
+  - 0.998 = 99.8% uptime (~1.2 min downtime per day)  
+  - 0.000 = completely offline  
+
+#### **C. Counting Layer**
+```promql
+count(...) * 1
+```
+- Same implementation as Slide 3  
+
+---
+
+### **4. Edge Case Handling**  
+
+| Scenario | Behavior |  
+|----------|----------|  
+| Node at exactly 0.999 | **Excluded** (counted as healthy) |  
+| Node alternating up/down | Depends on exact average |  
+| No metrics reported | Excluded (not counted as inactive) |  
+
+**Example:**  
+- 5 nodes with averages: [1.0, 0.999, 0.998, 0.9, 0.0]  
+- Inactive count: 3 (0.998, 0.9, 0.0)  
+- Note: 0.999 is **not** counted  
+
+---
+
+### **5. Real-World Example**  
+
+**Cluster Status:**  
+| Node | Avg Uptime | Classification |  
+|------|-----------|-----------------|  
+| A    | 1.000     | Healthy (ignored) |  
+| B    | 0.999     | Healthy (ignored) |  
+| C    | 0.998     | Unhealthy (counted) |  
+| D    | 0.500     | Unhealthy (counted) |  
+| E    | 0.000     | Unhealthy (counted) |  
+
+**Calculation:**  
+- Inactive Nodes: 3 (C, D, E)  
+- **Result:** `3`  
+
+---
+
+### **6. Why This Matters**  
+- Identifies nodes needing intervention  
+- Works in tandem with Slide 3 for full health picture  
+- Threshold aligns with operational SLAs  
+
+---
+
+### **Slide 4 Summary**  
+- **Output:** Count of nodes with <99.9% uptime  
+- **Key Feature:** No gray area - binary classification  
+- **Use Case:** Maintenance prioritization  
+
+---
+
+### **Transition to Slide 5**  
+Next will cover **Robin Server Status** with:  
+1. Two-threshold system (>99.9% healthy, <99% unhealthy)  
+2. Advanced `clamp_max` and `ceil` functions  
+3. Percentage-based health score  
+
+Confirm if you want to proceed with this structure!
+
+
+
