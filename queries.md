@@ -822,6 +822,357 @@ Let me know if you want to proceed with Slide 6!
 
 
 
+---
+
+### **Slide 6: Stormgr Status**  
+**Panel Name:** Stormgr Status  
+
+---
+
+### **1. Full PromQL Query**  
+```promql
+(
+  sum(clamp_max((avg_over_time(stormgr_status{cluster_type=~"$clustertype", cluster_name=~"$clustername"}[$__range]) > 0.999) * 1, 1)
+) / ceil(
+  sum(clamp_max((avg_over_time(...) > 0.999) * 1, 1)) +
+  sum(clamp_max((avg_over_time(...) < 0.999) * 1, 1))
+) * 100
+```
+
+---
+
+### **2. Whole Query Explanation**  
+**Purpose:**  
+Calculates the **availability percentage of Stormgr instances** using a strict two-threshold system:  
+- **Healthy**: >99.9% uptime.  
+- **Unhealthy**: <99.9% uptime.  
+- **No gray zone**: Unlike Robin Server Status, this query treats *anything below 99.9%* as unhealthy.  
+
+**Key Differences from Slide 5 (Robin Server):**  
+- Simpler threshold logic (only 99.9% cutoff).  
+- Explicitly counts all non-healthy instances as unhealthy.  
+
+---
+
+### **3. Numerator/Denominator Breakdown**  
+
+#### **Numerator (Healthy Stormgr Instances)**  
+```promql
+sum(clamp_max((avg_over_time(...) > 0.999) * 1, 1))
+```  
+**Logic Flow:**  
+1. **`avg_over_time(stormgr_status[...])`**  
+   - Computes the average health of each Stormgr instance over `$__range`.  
+   - Example: `[1, 1, 0.5]` → `(1 + 1 + 0.5)/3 = 0.833`.  
+
+2. **`> 0.999` Filter**  
+   - Converts averages to booleans: `1` if ≥99.9%, `0` otherwise.  
+
+3. **`clamp_max(..., 1)`**  
+   - Caps contributions to `1` per instance (prevents duplicates).  
+
+4. **`sum()`**  
+   - Aggregates healthy instances.  
+
+**Example:**  
+- 3 instances with averages: `[1.0, 0.999, 0.8]` → Healthy count = `2`.  
+
+#### **Denominator (Total Stormgr Instances)**  
+```promql
+ceil(sum(clamp_max(healthy)) + sum(clamp_max(unhealthy)))
+```  
+**Logic Flow:**  
+1. **Healthy Instances**: Same as numerator.  
+2. **Unhealthy Instances**: `< 0.999` (anything below the threshold).  
+3. **`ceil()`**  
+   - Rounds up the total to avoid division by zero.  
+
+**Example:**  
+- Healthy: `2`, Unhealthy: `1` → Total = `ceil(2 + 1) = 3`.  
+
+---
+
+### **4. Function Glossary**  
+
+#### **A. `avg_over_time()`**  
+| Property | Details |  
+|----------|---------|  
+| **Type** | Range vector function |  
+| **Input** | `stormgr_status` metric over `$__range` (e.g., `stormgr_status[24h]`). |  
+| **Output** | Average value (0–1) per instance. |  
+| **Purpose** | Smooths transient failures (e.g., 15-minute outage in 24h). |  
+
+#### **B. `clamp_max()`**  
+| Property | Details |  
+|----------|---------|  
+| **Type** | Clamping function |  
+| **Syntax** | `clamp_max(vector, max_value)` |  
+| **Use Case** | Prevents overcounting (e.g., duplicate metrics for the same instance). |  
+| **Example** | `clamp_max([2, 0.5], 1) → [1, 0.5]`. |  
+
+#### **C. `ceil()`**  
+| Property | Details |  
+|----------|---------|  
+| **Type** | Mathematical function |  
+| **Behavior** | Rounds up to the nearest integer. |  
+| **Why Used** | Ensures denominator is never zero. |  
+| **Example** | `ceil(2.1) = 3`. |  
+
+---
+
+### **5. Visualization**  
+
+#### **A. Data Flow Diagram**  
+```
+[Stormgr Metrics]  
+     ↓  
+avg_over_time() → [0.0–1.0 Scores]  
+     ↓  
+Threshold Filters:  
+- >0.999 → Healthy (1)  
+- <0.999 → Unhealthy (1)  
+     ↓  
+clamp_max(1) → [1, 0, 1, ...]  
+     ↓  
+sum() → Numerator (Healthy)  
+     ↓  
+sum() + sum() → Total (Healthy + Unhealthy)  
+     ↓  
+ceil() → Rounded Total  
+     ↓  
+Final % = (Healthy / Total) * 100  
+```
+
+#### **B. Threshold Spectrum**  
+``` 
+0%────[Unhealthy]────99.9%────[Healthy]────100%  
+```  
+
+---
+
+### **6. Edge Cases & Handling**  
+
+| Scenario | Solution | Example |  
+|----------|----------|---------|  
+| **Duplicate Metrics** | `clamp_max(1)` ensures each instance counts once. | Instance X tracked twice → counted as `1`. |  
+| **Missing Data** | `ceil()` handles gaps (e.g., `ceil(0) = 1`). | No instances → 0% health. |  
+| **Exact Threshold** | `0.999` is treated as healthy. | Instance at 99.9% → counted as healthy. |  
+
+---
+
+### **7. Real-World Example**  
+
+**Cluster with 5 Stormgr Instances:**  
+| Instance | Avg Health | Classification |  
+|----------|------------|-----------------|  
+| A        | 1.0        | Healthy         |  
+| B        | 0.999      | Healthy         |  
+| C        | 0.999      | Healthy         |  
+| D        | 0.998      | Unhealthy       |  
+| E        | 0.5        | Unhealthy       |  
+
+**Calculation:**  
+- **Numerator**: 3 (A, B, C).  
+- **Denominator**: `ceil(3 + 2) = 5`.  
+- **Health %**: `(3/5) * 100 = 60%`.  
+
+---
+
+### **8. Why This Design?**  
+1. **Simplicity**: Single threshold for clarity.  
+2. **Strict SLA Enforcement**: Treats anything below 99.9% as unhealthy.  
+3. **Resilience**: Handles data anomalies (duplicates/missing metrics).  
+
+---
+
+### **Next Slide Preview: Slide 7 (iomgr_status)**  
+- **Focus**: I/O Manager health.  
+- **Key Differences**:  
+  - Aggregation by `instance` label.  
+  - Denominator derived from Kubernetes node metrics.  
+- **Visualization**: Node-to-I/O Manager health correlation chart.  
+
+Let me know if you want to proceed!
+
+
+---
+
+### **Slide 7: iomgr_status**  
+**Panel Name:** iomgr_status  
+
+---
+
+### **1. Full PromQL Query**  
+```promql
+((sum(sum by (instance)(
+  clamp_max((avg_over_time(iomgr_status{cluster_type=~"$clustertype", cluster_name=~"$clustername"}[$__range]) > 0.999) * 1, 1)
+)))/(
+  (count(avg_over_time(up{job="kubernetes-nodes", cluster_type=~"$clustertype", cluster_name=~"$clustername"}[$__range]) > 0) * 1) + 
+  (count(avg_over_time(up{job="kubernetes-nodes", cluster_type=~"$clustertype", cluster_name=~"$clustername"}[$__range]) == 0) * 1)
+)) * 100
+```
+
+---
+
+### **2. Whole Query Explanation**  
+**Purpose:**  
+Calculates the **percentage of healthy I/O Manager (iomgr) instances** relative to the total number of Kubernetes nodes, including active and inactive nodes.  
+
+**Key Components:**  
+1. **Numerator**: Count of I/O Manager instances with >99.9% uptime.  
+2. **Denominator**: Total Kubernetes nodes (both active and inactive).  
+3. **Output**: `(Healthy I/O Managers / Total Nodes) * 100`.  
+
+---
+
+### **3. Numerator Breakdown**  
+**Code Segment:**  
+```promql
+sum(sum by (instance)(
+  clamp_max((avg_over_time(iomgr_status{...}[$__range]) > 0.999) * 1, 1)
+))
+```  
+
+**Step-by-Step Logic:**  
+1. **`avg_over_time(iomgr_status{...}[$__range])`**  
+   - Computes the average health of each I/O Manager instance over the time range.  
+   - Example: An instance with values `[1, 1, 0.8]` → `(1 + 1 + 0.8)/3 = 0.933`.  
+
+2. **`> 0.999` Filter**  
+   - Converts the average to `1` (healthy) if ≥99.9%, else `0`.  
+
+3. **`clamp_max(..., 1)`**  
+   - Ensures each I/O Manager instance contributes at most `1` (prevents duplicates).  
+
+4. **`sum by (instance)`**  
+   - Aggregates results per `instance` label (unique I/O Manager instances).  
+
+5. **Outer `sum()`**  
+   - Totals all healthy I/O Manager instances.  
+
+**Example:**  
+- 3 I/O Managers with averages: `[1.0, 0.9995, 0.98]` → Healthy count = `2`.  
+
+---
+
+### **4. Denominator Breakdown**  
+**Code Segment:**  
+```promql
+(
+  (count(avg_over_time(up{...} > 0) * 1) + 
+  (count(avg_over_time(up{...} == 0) * 1)
+)
+```  
+
+**Step-by-Step Logic:**  
+1. **Active Nodes**:  
+   - `count(avg_over_time(up{...}) > 0)` counts nodes with uptime >0%.  
+
+2. **Inactive Nodes**:  
+   - `count(avg_over_time(up{...}) == 0)` counts nodes with 0% uptime.  
+
+3. **Total Nodes**:  
+   - Sum of active and inactive nodes.  
+
+**Example:**  
+- 5 nodes: 3 active (>0% uptime), 2 inactive (0% uptime) → Total = `5`.  
+
+---
+
+### **5. Function Glossary**  
+
+#### **A. `avg_over_time()`**  
+| Property | Details |  
+|----------|---------|  
+| **Type** | Range vector function |  
+| **Input** | Metric series over `$__range` (e.g., `iomgr_status[24h]`). |  
+| **Output** | Arithmetic mean of values in the range. |  
+| **Purpose** | Reduces noise from transient failures. |  
+
+#### **B. `clamp_max()`**  
+| Property | Details |  
+|----------|---------|  
+| **Type** | Clamping function |  
+| **Behavior** | Caps values at a maximum (e.g., `clamp_max(2, 1) → 1`). |  
+| **Use Case** | Prevents duplicate metrics from skewing results. |  
+
+#### **C. `sum by (instance)`**  
+| Property | Details |  
+|----------|---------|  
+| **Type** | Aggregation operator |  
+| **Behavior** | Groups and sums data by the `instance` label. |  
+| **Purpose** | Ensures unique counting of I/O Manager instances. |  
+
+#### **D. `count()`**  
+| Property | Details |  
+|----------|---------|  
+| **Type** | Aggregation operator |  
+| **Behavior** | Counts time series matching a condition. |  
+| **Key Note** | Only counts nodes/IOMGR instances with metrics. |  
+
+---
+
+### **6. Visualization**  
+
+#### **A. Data Flow Diagram**  
+```
+[I/O Manager Metrics]    [Node Metrics]
+         ↓                       ↓
+avg_over_time()          avg_over_time()
+         ↓                       ↓
+>0.999 Filter             >0/==0 Filters
+         ↓                       ↓
+clamp_max(1)              count() + count()
+         ↓                       ↓
+sum by (instance)                │
+         ↓                       │
+sum() → Numerator                │
+         └───────────┬───────────┘
+                     ↓
+           (Numerator / Denominator) * 100
+```
+
+#### **B. Example Scenario**  
+| Component       | Count | Details |  
+|-----------------|-------|---------|  
+| Healthy IOMGR   | 3     | Instances A, B, C |  
+| Unhealthy IOMGR | 2     | Instances D, E |  
+| Active Nodes    | 4     | Nodes 1-4 |  
+| Inactive Nodes  | 1     | Node 5 |  
+
+**Calculation:**  
+- **Numerator**: 3  
+- **Denominator**: 5  
+- **Health %**: `(3/5) * 100 = 60%`  
+
+---
+
+### **7. Edge Cases**  
+
+| Scenario | Handling |  
+|----------|----------|  
+| **I/O Manager without Node** | Excluded (denominator counts nodes, not I/O Managers). |  
+| **Node without I/O Manager** | Included in denominator but not numerator. |  
+| **Data Gaps** | `count()` ignores nodes/IOMGRs with no metrics. |  
+
+---
+
+### **8. Why This Query Matters**  
+- **Operational Insight**: Correlates I/O Manager health with node availability.  
+- **Accuracy**: Uses `clamp_max` and `sum by` to ensure clean data.  
+- **Completeness**: Accounts for all nodes, active or inactive.  
+
+---
+
+### **Next Slide Preview: Slide 8 (PostgreSQL Status)**  
+- **Focus**: PostgreSQL cluster health.  
+- **Key Elements**:  
+  - Dual checks for Patroni and PostgreSQL instances.  
+  - Normalization by etcd cluster count.  
+- **Visualization**: Cluster health matrix.  
+
+Let me know if you want to proceed!
+
 
 
 
