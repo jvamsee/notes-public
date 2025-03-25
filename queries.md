@@ -614,3 +614,210 @@ Confirm if you want to proceed with this structure!
 
 
 
+
+
+
+---
+
+### **Slide 5: Robin Server Status**  
+**Panel Name:** Robin Server Status  
+
+---
+
+### **1. Full PromQL Query**  
+```promql
+sum(clamp_max(
+  (avg_over_time(robin_server_status{cluster_type=~"$clustertype", cluster_name=~"$clustername"}[$__range]) > 0.999) * 1,
+  1
+)) / ceil(
+  sum(clamp_max((avg_over_time(...) > 0.999) * 1, 1)) +
+  sum(clamp_max((avg_over_time(...) < 0.99) * 1, 1))
+) * 100
+```
+
+---
+
+### **2. Whole Query Explanation**  
+**Objective:**  
+Calculate the **percentage of Robin servers** that maintained >99.9% uptime over a time window, while explicitly ignoring servers in a "gray zone" (99%–99.9%).  
+
+**Key Components:**  
+1. **Healthy Servers**: Uptime >99.9%.  
+2. **Unhealthy Servers**: Uptime <99%.  
+3. **Total Servers**: Healthy + Unhealthy (borderline servers excluded).  
+4. **Percentage Formula**: `(Healthy / Total) * 100`.  
+
+---
+
+### **3. Numerator Breakdown**  
+**Code Segment:**  
+```promql
+sum(clamp_max(
+  (avg_over_time(...) > 0.999) * 1,
+  1
+))
+```  
+
+**Step-by-Step Logic:**  
+1. **`avg_over_time(robin_server_status[...])`**  
+   - Computes the average health of each Robin server over `$__range`.  
+   - Example: A server with metrics `[1, 1, 0, 1]` over 4 samples → `(1+1+0+1)/4 = 0.75`.  
+
+2. **`> 0.999` Comparison**  
+   - Converts the average to a boolean:  
+     - `1` (true) if average ≥99.9%.  
+     - `0` (false) otherwise.  
+
+3. **`* 1` Conversion**  
+   - Explicitly casts booleans (`true`/`false`) to integers (`1`/`0`).  
+
+4. **`clamp_max(..., 1)`**  
+   - Ensures each server contributes **at most `1`** to the sum.  
+   - Mitigates duplicate metrics (e.g., a server accidentally tracked twice).  
+
+5. **`sum()`**  
+   - Aggregates all `1`s (healthy servers) into a total count.  
+
+**Example:**  
+- 5 servers with averages: `[1.0, 0.9995, 0.999, 0.98, 0.99]`  
+- Healthy servers: `[1.0, 0.9995]` → **Numerator = 2**.  
+
+---
+
+### **4. Denominator Breakdown**  
+**Code Segment:**  
+```promql
+ceil(
+  sum(clamp_max((avg_over_time(...) > 0.999) * 1, 1)) +  // Healthy
+  sum(clamp_max((avg_over_time(...) < 0.99) * 1, 1))      // Unhealthy
+)
+```  
+
+**Step-by-Step Logic:**  
+1. **Healthy Count**  
+   - Same as the numerator (`sum(clamp_max(... > 0.999))`).  
+
+2. **Unhealthy Count**  
+   - `avg_over_time(...) < 0.99`: Flags servers with <99% uptime.  
+   - Example: A server with `0.98` average → counted as `1`.  
+
+3. **Borderline Servers**  
+   - Servers between 99% and 99.9% are **excluded** from both counts.  
+
+4. **`ceil()` Function**  
+   - Rounds up the sum of healthy and unhealthy servers.  
+   - Ensures the denominator is never `0` (avoids division errors).  
+
+**Example:**  
+- Healthy: `2`, Unhealthy: `1`, Borderline: `2` (excluded).  
+- **Denominator**: `ceil(2 + 1) = 3`.  
+
+---
+
+### **5. Function Glossary**  
+
+#### **A. `avg_over_time()`**  
+| Property | Details |  
+|----------|---------|  
+| **Type** | Range vector function |  
+| **Input** | A metric over a time range (e.g., `robin_server_status[1h]`). |  
+| **Output** | Arithmetic mean of all metric values in the range. |  
+| **Purpose** | Smooths transient failures (e.g., 5-minute downtime in 24h). |  
+| **Example** | `[1, 1, 0]` → `0.666`. |  
+
+#### **B. `clamp_max()`**  
+| Property | Details |  
+|----------|---------|  
+| **Type** | Clamping function |  
+| **Syntax** | `clamp_max(vector, scalar)` |  
+| **Behavior** | Caps values in `vector` at `scalar`. |  
+| **Use Case** | Prevents overcounting duplicate server metrics. |  
+| **Example** | `clamp_max([2, 0.5], 1) → [1, 0.5]`. |  
+
+#### **C. `ceil()`**  
+| Property | Details |  
+|----------|---------|  
+| **Type** | Mathematical function |  
+| **Behavior** | Rounds numbers up to the nearest integer. |  
+| **Purpose** | Conservative estimation of total servers. |  
+| **Example** | `ceil(2.1) = 3`. |  
+
+---
+
+### **6. Visualization**  
+
+#### **A. Data Flow Diagram**  
+```
+[Raw Metrics]  
+     ↓  
+avg_over_time() → [Health Scores]  
+     ↓  
+Threshold Filters:  
+- >0.999 → Healthy (1)  
+- <0.99 → Unhealthy (1)  
+     ↓  
+clamp_max(1) → [1, 0, 1, ...]  
+     ↓  
+sum() → Numerator (Healthy)  
+     ↓  
+sum() + sum() → Total (Healthy + Unhealthy)  
+     ↓  
+ceil() → Rounded Total  
+     ↓  
+Final % = (Numerator / Denominator) * 100  
+```
+
+#### **B. Threshold Spectrum**  
+``` 
+0%────[Unhealthy]────99%────[Ignored]────99.9%────[Healthy]────100%  
+```  
+
+---
+
+### **7. Edge Cases & Solutions**  
+
+| Scenario | Handling | Example |  
+|----------|----------|---------|  
+| **Duplicate Metrics** | `clamp_max(1)` limits contribution to `1` per server. | Server X tracked twice → counted once. |  
+| **Missing Data** | `ceil()` ensures denominator ≥1. | No servers → `ceil(0) = 1` → 0% health. |  
+| **Borderline Server** | Excluded from all counts. | Server at 99.5% → ignored. |  
+
+---
+
+### **8. Real-World Example**  
+
+**Cluster with 10 Robin Servers:**  
+| Server | Avg Uptime | Classification |  
+|--------|------------|-----------------|  
+| A      | 1.0        | Healthy         |  
+| B      | 0.9999     | Healthy         |  
+| C      | 0.999      | Healthy         |  
+| D      | 0.995      | **Ignored**     |  
+| E      | 0.98       | Unhealthy       |  
+
+**Calculation:**  
+- **Numerator**: 3 (A, B, C).  
+- **Denominator**: `ceil(3 + 1) = 4`.  
+- **Health %**: `(3/4) * 100 = 75%`.  
+
+---
+
+### **9. Why This Query Works**  
+1. **Precision**: Strict thresholds eliminate ambiguity.  
+2. **Resilience**: Handles duplicates and missing data gracefully.  
+3. **Clarity**: Explicitly ignores borderline cases to reduce noise.  
+
+---
+
+### **Next Slide Preview: Slide 6 (Stormgr Status)**  
+- **Focus**: Stormgr service availability.  
+- **Key Differences**:  
+  - Slightly lower threshold for "unhealthy" (0.99 vs. 0.999).  
+  - Additional aggregation by `instance`.  
+- **Visualization**: Heatmap of uptime distribution.  
+
+Let me know if you want to proceed with Slide 6!
+
+
+
+
