@@ -1354,3 +1354,166 @@ Let me know if you want to proceed!
 
 
 
+
+
+---
+
+### **Slide 9: robin_file_server**  
+**Panel Name:** robin_file_server  
+
+---
+
+### **1. Full PromQL Query**  
+```promql
+(
+  sum(clamp_max((avg_over_time(robin_file_server_status{cluster_type=~"$clustertype", cluster_name=~".+"}[$__range]) > 0.999) * 1, 1)
+) / count(count(avg_over_time(etcd_status{cluster_type=~"$clustertype", cluster_name=~"$clustername"}[$__range])) by (cluster_name))
+) * 100
+```
+
+---
+
+### **2. Whole Query Explanation**  
+**Purpose:**  
+Calculates the **percentage of healthy Robin File Server instances** relative to the total number of etcd clusters.  
+
+**Key Components:**  
+1. **Numerator**: Count of healthy file server instances (>99.9% uptime).  
+2. **Denominator**: Total etcd clusters (proxy for total clusters).  
+3. **Output**: `(Healthy File Servers / Total etcd Clusters) * 100`.  
+
+---
+
+### **3. Numerator Breakdown**  
+**Code Segment:**  
+```promql
+sum(clamp_max((avg_over_time(robin_file_server_status{...}[$__range]) > 0.999) * 1, 1))
+```  
+
+**Step-by-Step Logic:**  
+1. **`avg_over_time(robin_file_server_status[...])`**  
+   - Computes the average health of each file server over `$__range`.  
+   - Example: A server with values `[1, 1, 0.9]` → `(1 + 1 + 0.9)/3 = 0.966`.  
+
+2. **`> 0.999` Filter**  
+   - Converts averages to `1` if ≥99.9%, else `0`.  
+
+3. **`clamp_max(..., 1)`**  
+   - Prevents duplicate metrics (e.g., misconfigured scraping).  
+
+4. **`sum()`**  
+   - Aggregates all `1`s (healthy servers).  
+
+**Example:**  
+- 5 file servers with averages: `[1.0, 0.9995, 0.999, 0.98, 0.99]` → Healthy count = `3`.  
+
+---
+
+### **4. Denominator Breakdown**  
+**Code Segment:**  
+```promql
+count(count(avg_over_time(etcd_status{...}[$__range])) by (cluster_name))
+```  
+
+**Step-by-Step Logic:**  
+1. **Inner `avg_over_time(etcd_status[...])`**  
+   - Computes the average health of etcd nodes per cluster.  
+2. **Inner `count(...) by (cluster_name)`**  
+   - Counts etcd nodes per cluster (e.g., 3 nodes → count=3).  
+3. **Outer `count(...)`**  
+   - Counts the total number of etcd clusters.  
+
+**Example:**  
+- 4 etcd clusters → **Denominator = 4**.  
+
+---
+
+### **5. Function Glossary**  
+
+#### **A. `avg_over_time()`**  
+| Property | Details |  
+|----------|---------|  
+| **Type** | Range vector function |  
+| **Input** | `robin_file_server_status` over `$__range`. |  
+| **Output** | Mean value (0–1) per file server. |  
+| **Purpose** | Reduces noise from transient failures. |  
+
+#### **B. `clamp_max()`**  
+| Property | Details |  
+|----------|---------|  
+| **Type** | Clamping function |  
+| **Behavior** | Caps values at `1` (prevents duplicates). |  
+| **Example** | `clamp_max(2, 1) → 1`. |  
+
+#### **C. `count(count(...))`**  
+| Property | Details |  
+|----------|---------|  
+| **Nested Logic** | Counts etcd clusters. |  
+| **Why Used** | Normalizes file server health by cluster count. |  
+
+---
+
+### **6. Visualization**  
+
+#### **A. Data Flow Diagram**  
+```
+[File Server Metrics]        [ETCD Metrics]
+         │                           │
+avg_over_time()            avg_over_time()
+         │                           │
+>0.999 Filter              count(...) by cluster
+         │                           │
+clamp_max(1)               count() → Denominator
+         │                           │
+sum() → Numerator                    │
+         └───────────┬───────────────┘
+                     ↓
+           Final % = (Numerator / Denominator) * 100
+```
+
+#### **B. Threshold Spectrum**  
+``` 
+0%────[Unhealthy]────99.9%────[Healthy]────100%  
+```  
+
+---
+
+### **7. Edge Cases**  
+
+| Scenario | Handling |  
+|----------|----------|  
+| **No etcd Clusters** | Denominator = 0 → Returns "No Data". |  
+| **File Server Missing Metrics** | Excluded from numerator. |  
+| **Duplicate File Servers** | `clamp_max(1)` limits to 1 per instance. |  
+
+---
+
+### **8. Real-World Example**  
+
+**Environment:**  
+- **Healthy File Servers**: 3  
+- **Unhealthy File Servers**: 2  
+- **ETCD Clusters**: 3  
+
+**Calculation:**  
+- **Numerator**: `3`  
+- **Denominator**: `3`  
+- **Health %**: `(3/3) * 100 = 100%`  
+
+---
+
+### **9. Why This Query Works**  
+1. **Precision**: Strict 99.9% threshold ensures only reliable servers are counted.  
+2. **Resilience**: `clamp_max` handles duplicates; `count(count(...))` ensures accurate normalization.  
+3. **Clarity**: Directly correlates file server health with etcd cluster count.  
+
+---
+
+### **Next Slide Preview: Slide 10 (robin_monitor_status)**  
+- **Focus**: Health of Robin Monitor instances.  
+- **Key Elements**:  
+  - Uses Kubernetes node count as the denominator.  
+  - Combines active/inactive node states.  
+- **Visualization**: Node vs. monitor health matrix.  
+
+Let me know if you want to proceed!
