@@ -821,3 +821,185 @@ Let me know if you want to proceed with Slide 6!
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+---
+
+### **Slide 8: PostgreSQL Status**  
+**Panel Name:** PostgreSQL Status  
+
+---
+
+### **1. Full PromQL Query**  
+```promql
+(
+  ( sum((avg_over_time(robin_patroni_status{...}[$__range]) > 0.999) * 1) / 3 ) +
+  ( sum((avg_over_time(robin_pgsql_status{...}[$__range]) > 0.999) * 1) / 3 )
+) / count(count(avg_over_time(etcd_status{...}[$__range])) by (cluster_name))
+```
+
+---
+
+### **2. Whole Query Explanation**  
+**Purpose:**  
+Measures the **health of PostgreSQL clusters** by combining the status of Patroni (HA manager) and PostgreSQL instances, normalized by the number of etcd clusters.  
+
+**Key Components:**  
+1. **Patroni Health**: Average status of Patroni instances.  
+2. **PostgreSQL Health**: Average status of PostgreSQL instances.  
+3. **Normalization**: Assumes a 3-node quorum for both Patroni and PostgreSQL.  
+4. **Denominator**: Number of etcd clusters (used as a proxy for total clusters).  
+
+---
+
+### **3. Numerator Breakdown**  
+**Code Segment:**  
+```promql
+(
+  sum((avg_over_time(robin_patroni_status[...]) > 0.999) * 1) / 3 +
+  sum((avg_over_time(robin_pgsql_status[...]) > 0.999) * 1) / 3 
+)
+```  
+
+**Step-by-Step Logic:**  
+1. **Patroni Check**:  
+   - `avg_over_time(robin_patroni_status[...])`: Computes average health of Patroni instances over `$__range`.  
+   - `> 0.999`: Flags instances with >99.9% uptime.  
+   - `sum(...)`: Counts healthy Patroni instances.  
+   - `/ 3`: Normalizes by assuming 3-node quorum.  
+
+2. **PostgreSQL Check**:  
+   - Same logic applied to `robin_pgsql_status`.  
+
+3. **Combined Score**:  
+   - Adds normalized Patroni and PostgreSQL health scores.  
+
+**Example:**  
+- 3 healthy Patroni instances → `3/3 = 1`.  
+- 2 healthy PostgreSQL instances → `2/3 = 0.666`.  
+- **Total Numerator**: `1 + 0.666 = 1.666`.  
+
+---
+
+### **4. Denominator Breakdown**  
+**Code Segment:**  
+```promql
+count(count(avg_over_time(etcd_status{...}[$__range])) by (cluster_name))
+```  
+
+**Step-by-Step Logic:**  
+1. **Inner `avg_over_time(etcd_status[...])`**:  
+   - Computes average health of etcd nodes per cluster.  
+2. **Inner `count(...) by (cluster_name)`**:  
+   - Counts etcd nodes per cluster (e.g., 3 nodes → count=3).  
+3. **Outer `count(...)`**:  
+   - Counts the total number of etcd clusters.  
+
+**Example:**  
+- 2 etcd clusters → **Denominator = 2**.  
+
+---
+
+### **5. Function Glossary**  
+
+#### **A. `avg_over_time()`**  
+- **Type**: Range vector function.  
+- **Input**: Metric over `$__range` (e.g., `robin_patroni_status[1h]`).  
+- **Output**: Arithmetic mean of values in the range.  
+- **Purpose**: Smooths transient failures (e.g., 5-minute downtime).  
+
+#### **B. `sum()`**  
+- **Type**: Aggregation operator.  
+- **Behavior**: Sums values across matching time series.  
+- **Use Case**: Counts healthy Patroni/PostgreSQL instances.  
+
+#### **C. Division (`/ 3`)**  
+- **Purpose**: Normalizes scores for a 3-node cluster.  
+- **Assumption**: Each cluster has 3 Patroni/PostgreSQL nodes.  
+
+#### **D. `count(count(...))`**  
+- **Nested Logic**:  
+  - Inner `count()`: Counts etcd nodes per cluster.  
+  - Outer `count()`: Counts total etcd clusters.  
+
+---
+
+### **6. Visualization**  
+
+#### **A. Data Flow Diagram**  
+```
+[Patroni Metrics]           [PostgreSQL Metrics]
+         │                           │
+avg_over_time()            avg_over_time()
+         │                           │
+>0.999 Filter              >0.999 Filter
+         │                           │
+sum() / 3                 sum() / 3 
+         └───────────┬───────────────┘
+                     ↓
+               Combined Numerator
+                     │
+[ETCD Metrics]        │
+         │            │
+avg_over_time()       │
+         │            │
+count(...) by cluster │
+         │            │
+count() → Denominator │
+         └───────┬────┘
+                 ↓
+         Final % = (Numerator / Denominator)
+```
+
+#### **B. Example Scenario**  
+| Component          | Value       |  
+|--------------------|-------------|  
+| Healthy Patroni    | 3 (3/3 = 1) |  
+| Healthy PostgreSQL | 2 (2/3 = 0.666) |  
+| ETCD Clusters      | 2           |  
+
+**Calculation:**  
+- **Numerator**: `1 + 0.666 = 1.666`  
+- **Denominator**: `2`  
+- **Health %**: `1.666 / 2 = 83.3%`  
+
+---
+
+### **7. Edge Cases**  
+
+| Scenario | Handling |  
+|----------|----------|  
+| **Cluster with >3 Nodes** | Normalized to 1 (`clamp_max` not needed due to `/3`). |  
+| **No ETCD Clusters** | Denominator = 0 → Returns "No Data". |  
+| **Partial Metrics** | Only nodes with data are counted. |  
+
+---
+
+### **8. Why This Query Works**  
+1. **Comprehensive**: Combines Patroni and PostgreSQL health.  
+2. **Normalized**: Accounts for 3-node clusters.  
+3. **ETCD Alignment**: Uses etcd clusters as the scaling factor.  
+
+--- 
+
+### **Next Slide Preview: Slide 9 (robin_file_server)**  
+- **Focus**: File server health relative to etcd clusters.  
+- **Key Elements**:  
+  - Single threshold (>99.9%) for file servers.  
+  - Normalization by etcd cluster count.  
+- **Visualization**: File server vs. etcd health heatmap.  
+
+Let me know if you want to proceed!
+
+
+
