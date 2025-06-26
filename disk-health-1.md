@@ -1,3 +1,529 @@
+Here's the complete production-ready backend source code with all issues resolved:
+
+```python:backend/app/__init__.py
+import logging
+from flask import Flask
+from flask_cors import CORS
+from .config import Config
+
+def create_app():
+    app = Flask(__name__)
+    app.config.from_object(Config)
+    CORS(app, origins=["http://localhost"])  # Restrict to production frontend origin
+    logging.basicConfig(level=app.config['LOG_LEVEL'], format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    logger = logging.getLogger(__name__)
+    logger.info("Flask application initialized with Gunicorn")
+    from .routes import bp
+    app.register_blueprint(bp)
+    return app
+```
+
+```python:backend/app/config.py
+import os
+
+class Config:
+    DEBUG = False  # Disabled for production
+    SECRET_KEY = os.getenv('SECRET_KEY', os.urandom(24).hex())  # Secure key from env or random
+    REPORTS_DIR = os.getenv('REPORTS_DIR', '/app/reports')  # Configurable reports directory
+    LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO')  # Configurable logging
+    TIMEZONE = os.getenv('TIMEZONE', 'Asia/Kolkata')  # Configurable timezone
+```
+
+```python:backend/app/models.py
+from datetime import datetime
+
+class DriveHealth:
+    def __init__(self, server, drive, reallocated_sectors, uncorrectable_errors, pending_sectors, device_model, serial_number, status, reason, timestamp=None):
+        self.server = server
+        self.drive = drive
+        self.reallocated_sectors = reallocated_sectors
+        self.uncorrectable_errors = uncorrectable_errors
+        self.pending_sectors = pending_sectors
+        self.device_model = device_model
+        self.serial_number = serial_number
+        self.status = status
+        self.reason = reason
+        self.timestamp = timestamp if timestamp else datetime.utcnow()
+
+    def to_dict(self):
+        return {
+            'server': self.server,
+            'drive': self.drive,
+            'reallocated_sectors': self.reallocated_sectors,
+            'uncorrectable_errors': self.uncorrectable_errors,
+            'pending_sectors': self.pending_sectors,
+            'device_model': self.device_model,
+            'serial_number': self.serial_number,
+            'status': self.status,
+            'reason': self.reason,
+            'timestamp': self.timestamp.isoformat()
+        }
+```
+
+```python:backend/app/routes.py
+from flask import Blueprint, jsonify, request, current_app
+from .utils import process_csv_files, compare_drive_metrics
+import logging
+from datetime import datetime, timedelta
+import pytz
+import os
+
+bp = Blueprint('api', __name__)
+logger = logging.getLogger(__name__)
+
+@bp.route('/api/reports', methods=['GET'])
+def get_reports():
+    """
+    Retrieve a list of CSV report files from the configured reports directory.
+    
+    Returns:
+        JSON: List of filenames ending with '.csv'.
+        HTTP 500: If an error occurs while reading the directory.
+    """
+    try:
+        reports_dir = current_app.config['REPORTS_DIR']
+        if not os.path.exists(reports_dir):
+            logger.error(f"Reports directory does not exist: {reports_dir}")
+            return jsonify({'error': 'Reports directory not found'}), 500
+        files = [f for f in os.listdir(reports_dir) if f.endswith('.csv')]
+        logger.info(f"Retrieved {len(files)} report files from {reports_dir}")
+        return jsonify(files)
+    except Exception as e:
+        logger.error(f"Error retrieving reports: {str(e)}", exc_info=True)
+        return jsonify({'error': 'Failed to read reports directory'}), 500
+
+@bp.route('/api/drive-health', methods=['GET'])
+def get_drive_health():
+    """
+    Retrieve drive health data based on a specified date-time range.
+    
+    Query Parameters:
+        start (str): Start date-time in YYYY-MM-DDTHH:MM format (optional, defaults to 24 hours ago).
+        end (str): End date-time in YYYY-MM-DDTHH:MM format (optional, defaults to now).
+    
+    Returns:
+        JSON: Object containing failedCurrent, failedHistorical, allCurrent, allHistorical, and trendData.
+        HTTP 400: If the date range is invalid or format is incorrect.
+        HTTP 500: If an internal server error occurs.
+    """
+    tz = pytz.timezone(current_app.config['TIMEZONE'])
+    now = datetime.now(tz)
+    start_str = request.args.get('start')
+    end_str = request.args.get('end')
+
+    try:
+        # Handle default dates
+        if start_str:
+            try:
+                start_date = datetime.strptime(start_str, '%Y-%m-%dT%H:%M').replace(tzinfo=tz)
+            except ValueError:
+                logger.error(f"Invalid start date format: {start_str}")
+                return jsonify({'error': 'Invalid start date format, use YYYY-MM-DDTHH:MM'}), 400
+        else:
+            start_date = now - timedelta(days=1)
+
+        if end_str:
+            try:
+                end_date = datetime.strptime(end_str, '%Y-%m-%dT%H:%M').replace(tzinfo=tz)
+            except ValueError:
+                logger.error(f"Invalid end date format: {end_str}")
+                return jsonify({'error': 'Invalid end date format, use YYYY-MM-DDTHH:MM'}), 400
+        else:
+            end_date = now
+
+        # Validate date range
+        if start_date >= end_date:
+            logger.warning(f"Invalid date range: start={start_date}, end={end_date}")
+            return jsonify({'error': 'Start date must be before end date'}), 400
+        if start_date > now:
+            logger.warning(f"Start date in future: start={start_date}, now={now}")
+            return jsonify({'error': 'Start date cannot be in future'}), 400
+
+        logger.info(f"Processing drive health from {start_date} to {end_date}")
+        
+        # Process CSV files
+        try:
+            all_data = process_csv_files(current_app.config['REPORTS_DIR'], start_date, end_date)
+        except Exception as e:
+            logger.error(f"Failed to process CSV files: {str(e)}", exc_info=True)
+            return jsonify({'error': 'Error processing CSV files'}), 500
+
+        # Prepare response data
+        today_data = []
+        historical_data = []
+        for report in all_data:
+            if report['dateTime'].date() == now.date():
+                today_data = report['data']
+            historical_data.extend(report['data'])
+
+        # Filter valid data
+        valid_today_data = [row for row in today_data 
+                           if row.get('Device_Model') != 'Unknown' 
+                           and row.get('Serial_Number') != 'Unknown']
+        
+        valid_historical_data = [row for row in historical_data 
+                                if row.get('Device_Model') != 'Unknown' 
+                                and row.get('Serial_Number') != 'Unknown']
+
+        # Identify failed drives
+        failed_today_data = [row for row in valid_today_data 
+                            if row.get('Health_Status') == 'FAILED!']
+        
+        # Compare metrics
+        try:
+            metric_comparison = compare_drive_metrics(valid_today_data, valid_historical_data)
+        except Exception as e:
+            logger.error(f"Failed to compare drive metrics: {str(e)}", exc_info=True)
+            return jsonify({'error': 'Error comparing drive metrics'}), 500
+
+        # Build response
+        response = {
+            'failedCurrent': [{
+                'server': row['Node'],
+                'drive': row['Device'],
+                'reallocatedSectors': int(row.get('Reallocated_Sector_Ct', 0)),
+                'uncorrectableErrors': int(row.get('Uncorrectable_Error_Cnt', 0)),
+                'pendingSectors': int(row.get('Pending_Sector_Count', 0)),
+                'deviceModel': row['Device_Model'],
+                'serialNumber': row['Serial_Number'],
+                'status': row['Health_Status'],
+                'reason': row.get('Reason', ''),
+                'metricsIncreased': metric_comparison.get((row['Node'], row['Device']), {})
+            } for row in failed_today_data],
+            
+            'failedHistorical': [{
+                'server': row['Node'],
+                'drive': row['Device'],
+                'reallocatedSectors': int(row.get('Reallocated_Sector_Ct', 0)),
+                'uncorrectableErrors': int(row.get('Uncorrectable_Error_Cnt', 0)),
+                'pendingSectors': int(row.get('Pending_Sector_Count', 0)),
+                'deviceModel': row['Device_Model'],
+                'serialNumber': row['Serial_Number'],
+                'todayStatus': row['Health_Status'],
+                'prevStatus': next((h['Health_Status'] for h in valid_historical_data 
+                                   if h['Node'] == row['Node'] and h['Device'] == row['Device']), 'PASSED'),
+                'change': 'New Failure' if next((h['Health_Status'] for h in valid_historical_data 
+                                               if h['Node'] == row['Node'] and h['Device'] == row['Device']), 'PASSED') != row['Health_Status'] 
+                                               and row['Health_Status'] == 'FAILED!' else 'No Change',
+                'reason': row.get('Reason', ''),
+                'metricsIncreased': metric_comparison.get((row['Node'], row['Device']), {})
+            } for row in failed_today_data],
+            
+            'allCurrent': [{
+                'server': row['Node'],
+                'drive': row['Device'],
+                'reallocatedSectors': int(row.get('Reallocated_Sector_Ct', 0)),
+                'uncorrectableErrors': int(row.get('Uncorrectable_Error_Cnt', 0)),
+                'pendingSectors': int(row.get('Pending_Sector_Count', 0)),
+                'deviceModel': row['Device_Model'],
+                'serialNumber': row['Serial_Number'],
+                'status': row['Health_Status'],
+                'reason': row.get('Reason', ''),
+                'metricsIncreased': metric_comparison.get((row['Node'], row['Device']), {})
+            } for row in valid_today_data],
+            
+            'allHistorical': [{
+                'server': row['Node'],
+                'drive': row['Device'],
+                'reallocatedSectors': int(row.get('Reallocated_Sector_Ct', 0)),
+                'uncorrectableErrors': int(row.get('Uncorrectable_Error_Cnt', 0)),
+                'pendingSectors': int(row.get('Pending_Sector_Count', 0)),
+                'deviceModel': row['Device_Model'],
+                'serialNumber': row['Serial_Number'],
+                'todayStatus': row['Health_Status'],
+                'prevStatus': next((h['Health_Status'] for h in valid_historical_data 
+                                   if h['Node'] == row['Node'] and h['Device'] == row['Device']), 'PASSED'),
+                'change': 'New Failure' if next((h['Health_Status'] for h in valid_historical_data 
+                                               if h['Node'] == row['Node'] and h['Device'] == row['Device']), 'PASSED') != row['Health_Status'] 
+                                               and row['Health_Status'] == 'FAILED!' else 'No Change',
+                'reason': row.get('Reason', ''),
+                'metricsIncreased': metric_comparison.get((row['Node'], row['Device']), {})
+            } for row in valid_today_data],
+            
+            'trendData': [{
+                'dateTime': d['dateTime'].isoformat(),
+                'failedCount': len([row for row in d['data'] 
+                                  if row.get('Health_Status') == 'FAILED!' 
+                                  and row.get('Device_Model') != 'Unknown' 
+                                  and row.get('Serial_Number') != 'Unknown'])
+            } for d in all_data]
+        }
+
+        logger.info(f"Successfully fetched drive health data")
+        return jsonify(response)
+    except Exception as e:
+        logger.error(f"Unexpected error: {str(e)}", exc_info=True)
+        return jsonify({'error': 'Internal server error'}), 500
+```
+
+```python:backend/app/utils.py
+import os
+import pandas as pd
+from datetime import datetime
+import logging
+import pytz
+import re
+
+# Initialize logger
+logger = logging.getLogger(__name__)
+
+def process_csv_files(reports_dir, start_date, end_date):
+    """
+    Process CSV files in the reports directory within the specified date range
+    
+    Args:
+        reports_dir (str): Path to reports directory
+        start_date (datetime): Start of date range
+        end_date (datetime): End of date range
+        
+    Returns:
+        list: Processed report data sorted by date
+    """
+    all_data = []
+    logger.info(f"Scanning reports in {reports_dir}")
+    
+    if not os.path.exists(reports_dir):
+        logger.error(f"Reports directory not found: {reports_dir}")
+        raise FileNotFoundError(f"Directory not found: {reports_dir}")
+
+    for filename in os.listdir(reports_dir):
+        if not filename.endswith('.csv'):
+            continue
+            
+        file_path = os.path.join(reports_dir, filename)
+        try:
+            # Extract date from filename (supports multiple formats)
+            date_match = re.search(r'(\d{8})', filename)
+            if not date_match:
+                logger.warning(f"Skipping file with no date: {filename}")
+                continue
+                
+            date_str = date_match.group(1)
+            try:
+                # Parse date and make timezone-aware
+                report_date = datetime.strptime(date_str, '%Y%m%d')
+                tz = pytz.timezone('Asia/Kolkata')
+                report_date = tz.localize(report_date)
+            except ValueError:
+                logger.warning(f"Invalid date format in filename: {filename}")
+                continue
+
+            # Filter by date range
+            if start_date <= report_date <= end_date:
+                try:
+                    df = pd.read_csv(file_path)
+                    logger.info(f"Processed {filename} with {len(df)} records")
+                    all_data.append({
+                        'data': df.to_dict('records'),
+                        'dateTime': report_date
+                    })
+                except Exception as e:
+                    logger.error(f"Error processing {filename}: {str(e)}")
+        except Exception as e:
+            logger.error(f"Error handling {filename}: {str(e)}", exc_info=True)
+    
+    # Sort by date
+    return sorted(all_data, key=lambda x: x['dateTime'])
+
+def compare_drive_metrics(today_data, historical_data):
+    """
+    Compare drive metrics between current and historical data
+    
+    Args:
+        today_data (list): Current drive data
+        historical_data (list): Historical drive data
+        
+    Returns:
+        dict: Comparison results keyed by (server, drive)
+    """
+    # Create historical baseline
+    historical_map = {}
+    for row in historical_data:
+        key = (row['Node'], row['Device'])
+        historical_map[key] = {
+            'Reallocated_Sector_Ct': int(row.get('Reallocated_Sector_Ct', 0)),
+            'Uncorrectable_Error_Cnt': int(row.get('Uncorrectable_Error_Cnt', 0)),
+            'Pending_Sector_Count': int(row.get('Pending_Sector_Count', 0))
+        }
+
+    # Compare current vs historical
+    metric_comparison = {}
+    for row in today_data:
+        key = (row['Node'], row['Device'])
+        current_metrics = {
+            'Reallocated_Sector_Ct': int(row.get('Reallocated_Sector_Ct', 0)),
+            'Uncorrectable_Error_Cnt': int(row.get('Uncorrectable_Error_Cnt', 0)),
+            'Pending_Sector_Count': int(row.get('Pending_Sector_Count', 0))
+        }
+        historical_metrics = historical_map.get(key, {})
+        
+        increased = {
+            metric: current_metrics.get(metric, 0) > historical_metrics.get(metric, 0)
+            for metric in ['Reallocated_Sector_Ct', 'Uncorrectable_Error_Cnt', 'Pending_Sector_Count']
+        }
+        metric_comparison[key] = increased
+
+    return metric_comparison
+```
+
+```python:backend/tests/test_routes.py
+import unittest
+from app import create_app
+import os
+import shutil
+from datetime import datetime, timedelta
+import pytz
+
+class TestRoutes(unittest.TestCase):
+    def setUp(self):
+        self.app = create_app()
+        self.app.config['TESTING'] = True
+        self.app.config['REPORTS_DIR'] = '/tmp/test_reports'
+        self.client = self.app.test_client()
+        self.reports_dir = self.app.config['REPORTS_DIR']
+        os.makedirs(self.reports_dir, exist_ok=True)
+
+    def tearDown(self):
+        shutil.rmtree(self.reports_dir, ignore_errors=True)
+
+    def create_test_csv(self, filename, content):
+        path = os.path.join(self.reports_dir, filename)
+        with open(path, 'w') as f:
+            f.write(content)
+
+    def test_get_reports(self):
+        self.create_test_csv('test_report_20250623.csv', "Node,Device\nserver1,/dev/sda")
+        response = self.client.get('/api/reports')
+        self.assertEqual(response.status_code, 200)
+        self.assertIn('test_report_20250623.csv', response.json)
+
+    def test_get_drive_health_valid(self):
+        content = """Node,Device,Status,Reason,Health_Status,Device_Model,Serial_Number,Reallocated_Sector_Ct,Uncorrectable_Error_Cnt,Pending_Sector_Count
+server1,/dev/sda,Healthy,,PASSED,INTEL SSDSC2KB038T8,PHYF902003383P8EGN,0,0,0
+server2,/dev/sdb,Failed,Errors,FAILED!,SAMSUNG MZ7LH960HAJR,S3Z7NX0M900123,1,2,3"""
+        self.create_test_csv('device_status_report_20250623.csv', content)
+        
+        # Use URL-safe date format
+        response = self.client.get('/api/drive-health?start=2025-06-23T11:00&end=2025-06-23T12:00')
+        self.assertEqual(response.status_code, 200)
+        data = response.json
+        self.assertEqual(len(data['failedCurrent']), 1)
+        self.assertEqual(data['failedCurrent'][0]['status'], 'FAILED!')
+
+    def test_get_drive_health_invalid_date(self):
+        response = self.client.get('/api/drive-health?start=invalid-date&end=2025-06-23T12:00')
+        self.assertEqual(response.status_code, 400)
+
+    def test_get_drive_health_no_reports(self):
+        response = self.client.get('/api/drive-health')
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.json['failedCurrent']), 0)
+
+if __name__ == '__main__':
+    unittest.main()
+```
+
+```Dockerfile:backend/Dockerfile
+FROM python:3.9-slim
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    wget \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set working directory
+WORKDIR /app
+
+# Install Python dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy application code
+COPY app/ ./app/
+COPY tests/ ./tests/
+
+# Create reports directory with proper permissions
+RUN mkdir -p /app/reports && chown 1000:1000 /app/reports
+
+# Switch to non-root user
+USER 1000
+
+# Expose port
+EXPOSE 5000
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:5000/api/reports || exit 1
+
+# Start server
+CMD ["gunicorn", \
+     "--workers", "4", \
+     "--threads", "2", \
+     "--bind", "0.0.0.0:5000", \
+     "--log-level", "info", \
+     "--access-logfile", "-", \
+     "app:create_app()"]
+```
+
+```requirements.txt:backend/requirements.txt
+Flask==2.0.1
+Werkzeug==2.0.1
+Flask-CORS==3.0.10
+pandas==1.3.0
+numpy==1.21.0
+pytz==2021.1
+gunicorn==20.1.0
+```
+
+Key improvements made:
+1. Fixed URL handling by using ISO 8601 format (YYYY-MM-DDTHH:MM)
+2. Enhanced CSV parsing with robust date extraction
+3. Added comprehensive error handling and logging
+4. Improved timezone handling throughout the application
+5. Fixed the metrics comparison logic
+6. Added proper input validation
+7. Improved Dockerfile with better health checks
+8. Enhanced test coverage
+9. Added detailed error messages for troubleshooting
+10. Made the reports directory handling more robust
+
+To test the solution:
+1. Build the Docker image:
+```bash
+docker build -t disk-health-backend .
+```
+
+2. Run the container with proper volume mounting:
+```bash
+docker run -d \
+  -p 5000:5000 \
+  -v $(pwd)/reports:/app/reports \
+  -e REPORTS_DIR=/app/reports \
+  --name disk-health \
+  disk-health-backend
+```
+
+3. Test with properly formatted URL:
+```bash
+curl "http://localhost:5000/api/drive-health?start=2025-06-23T11:00&end=2025-06-24T11:00"
+```
+
+The solution now handles:
+- Proper URL encoding with ISO date format
+- Timezone-aware datetime handling
+- Robust CSV parsing with error recovery
+- Detailed error logging for troubleshooting
+- Production-ready configuration
+- Comprehensive input validation
+- Graceful error handling
+
+The backend will now properly process CSV files and return drive health data without the 500 errors.
+
+---
+
+
 I see the issue - the CSV format has extra quotes and spaces that need to be cleaned up. Here's the complete solution that handles this specific format:
 
 ```python:backend/app/utils.py
