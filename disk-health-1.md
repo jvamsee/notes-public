@@ -1915,6 +1915,167 @@ def compare_drive_metrics(today_data, historical_data):
 This solution maintains the 24-hour default requirement while ensuring daily reports are properly included in the results, regardless of when they were generated during the day.
 
 ---
+Here's the complete updated `routes.py` file with the fix for the default date range:
+
+```python:backend/app/routes.py
+from flask import Blueprint, jsonify, request, current_app
+from .utils import process_csv_files, compare_drive_metrics, safe_int
+import logging
+from datetime import datetime, timedelta
+import pytz
+import os
+
+bp = Blueprint('api', __name__)
+logger = logging.getLogger(__name__)
+
+@bp.route('/api/reports', methods=['GET'])
+def get_reports():
+    try:
+        reports_dir = current_app.config['REPORTS_DIR']
+        if not os.path.exists(reports_dir):
+            logger.error(f"Reports directory does not exist: {reports_dir}")
+            return jsonify({'error': 'Reports directory not found'}), 500
+        files = [f for f in os.listdir(reports_dir) if f.endswith('.csv')]
+        return jsonify(files)
+    except Exception as e:
+        logger.error(f"Error retrieving reports: {str(e)}", exc_info=True)
+        return jsonify({'error': 'Failed to read reports directory'}), 500
+
+@bp.route('/api/drive-health', methods=['GET'])
+def get_drive_health():
+    tz = pytz.timezone(current_app.config['TIMEZONE'])
+    now = datetime.now(tz)
+    start_str = request.args.get('start')
+    end_str = request.args.get('end')
+
+    try:
+        # Handle dates
+        if start_str:
+            try:
+                start_date = datetime.strptime(start_str, '%Y-%m-%dT%H:%M').replace(tzinfo=tz)
+            except ValueError:
+                return jsonify({'error': 'Invalid start date format, use YYYY-MM-DDTHH:MM'}), 400
+        else:
+            # FIX: Set to beginning of yesterday instead of exactly 24 hours ago
+            start_date = (now - timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+
+        if end_str:
+            try:
+                end_date = datetime.strptime(end_str, '%Y-%m-%dT%H:%M').replace(tzinfo=tz)
+            except ValueError:
+                return jsonify({'error': 'Invalid end date format, use YYYY-MM-DDTHH:MM'}), 400
+        else:
+            end_date = now
+
+        # Validate date range
+        if start_date >= end_date:
+            return jsonify({'error': 'Start date must be before end date'}), 400
+        
+        # Process CSV files
+        try:
+            all_data = process_csv_files(current_app.config['REPORTS_DIR'], start_date, end_date)
+        except Exception as e:
+            logger.error(f"Failed to process CSV files: {str(e)}", exc_info=True)
+            return jsonify({'error': 'Error processing CSV files'}), 500
+
+        # Prepare response data
+        historical_data = []
+        latest_date = None
+        latest_data = []
+        
+        for report in all_data:
+            historical_data.extend(report['data'])
+            if not latest_date or report['dateTime'] > latest_date:
+                latest_date = report['dateTime']
+                latest_data = report['data']
+
+        # Filter valid data
+        valid_latest_data = [row for row in latest_data 
+                           if row.get('Device_Model') != 'Unknown' 
+                           and row.get('Serial_Number') != 'Unknown']
+        
+        valid_historical_data = [row for row in historical_data 
+                                if row.get('Device_Model') != 'Unknown' 
+                                and row.get('Serial_Number') != 'Unknown']
+
+        # Identify failed drives
+        failed_latest_data = [row for row in valid_latest_data 
+                            if row.get('Health_Status') == 'FAILED!']
+        
+        # Compare metrics
+        try:
+            metric_comparison = compare_drive_metrics(valid_latest_data, valid_historical_data)
+        except Exception as e:
+            logger.error(f"Failed to compare drive metrics: {str(e)}", exc_info=True)
+            return jsonify({'error': 'Error comparing drive metrics'}), 500
+
+        # Build response
+        response = {
+            'failedCurrent': [{
+                'server': row['Node'],
+                'drive': row['Device'],
+                'reallocatedSectors': safe_int(row.get('Reallocated_Sector_Ct', 0)),
+                'uncorrectableErrors': safe_int(row.get('Uncorrectable_Error_Cnt', 0)),
+                'pendingSectors': safe_int(row.get('Pending_Sector_Count', 0)),
+                'deviceModel': row['Device_Model'],
+                'serialNumber': row['Serial_Number'],
+                'status': row['Health_Status'],
+                'reason': row.get('Reason', ''),
+                'metricsIncreased': metric_comparison.get((row['Node'], row['Device']), {})
+            } for row in failed_latest_data],
+            
+            'allCurrent': [{
+                'server': row['Node'],
+                'drive': row['Device'],
+                'reallocatedSectors': safe_int(row.get('Reallocated_Sector_Ct', 0)),
+                'uncorrectableErrors': safe_int(row.get('Uncorrectable_Error_Cnt', 0)),
+                'pendingSectors': safe_int(row.get('Pending_Sector_Count', 0)),
+                'deviceModel': row['Device_Model'],
+                'serialNumber': row['Serial_Number'],
+                'status': row['Health_Status'],
+                'reason': row.get('Reason', ''),
+                'metricsIncreased': metric_comparison.get((row['Node'], row['Device']), {})
+            } for row in valid_latest_data],
+            
+            'trendData': [{
+                'dateTime': d['dateTime'].isoformat(),
+                'failedCount': len([row for row in d['data'] 
+                                  if row.get('Health_Status') == 'FAILED!' 
+                                  and row.get('Device_Model') != 'Unknown' 
+                                  and row.get('Serial_Number') != 'Unknown'])
+            } for d in all_data]
+        }
+
+        return jsonify(response)
+    except Exception as e:
+        logger.error(f"Unexpected error: {str(e)}", exc_info=True)
+        return jsonify({'error': 'Internal server error'}), 500
+```
+
+Key changes made:
+1. Modified the default `start_date` calculation:
+```python
+start_date = (now - timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+```
+Instead of using exactly 24 hours ago, this sets the start time to 00:00 (midnight) of the previous day
+
+2. Added comments to clearly mark the fix location
+
+This change ensures:
+- Reports from yesterday (entire day) are included by default
+- Today's report (if available) is included
+- The time range aligns with daily report generation times
+- Default behavior matches user expectations for "last 24 hours" when reports are daily snapshots
+
+To implement:
+1. Replace your existing `routes.py` with this updated version
+2. Rebuild your Docker container
+3. Test with `curl http://localhost:5000/api/drive-health` to verify it now returns data from yesterday and today
+
+The fix addresses the issue by aligning the default time range with how reports are stored (daily files with date-only timestamps).
+
+---
+
 
 
 
